@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -38,15 +38,6 @@ app.add_middleware(
 
 MODEL_PATH = "models/revalue_efficientnet_b0_v2_best.pth"
 
-CLASSES = [
-    "Glass",
-    "Metal",
-    "Organic",
-    "Other",
-    "Paper_Cardboard",
-    "Plastic"
-]
-
 IMAGE_SIZE = 224
 
 DEVICE = torch.device(
@@ -76,31 +67,43 @@ print("=" * 60)
 print("Loading ReValue AI V2 model...")
 print("=" * 60)
 
-model = models.efficientnet_b0(weights=None)
-
-model.classifier[1] = nn.Linear(
-    model.classifier[1].in_features,
-    len(CLASSES)
-)
-
 checkpoint = torch.load(
     MODEL_PATH,
-    map_location=DEVICE
+    map_location=DEVICE,
+    weights_only=False
 )
 
-# V2 menggunakan checkpoint dictionary
+# Ambil kelas sesuai urutan saat training
 if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+
+    if "classes" not in checkpoint:
+        raise ValueError(
+            "Checkpoint tidak memiliki informasi classes."
+        )
+
+    CLASSES = checkpoint["classes"]
+
+    model = models.efficientnet_b0(weights=None)
+
+    model.classifier[1] = nn.Linear(
+        model.classifier[1].in_features,
+        len(CLASSES)
+    )
+
     model.load_state_dict(
         checkpoint["model_state_dict"]
     )
+
 else:
-    # fallback kalau checkpoint berupa state_dict langsung
-    model.load_state_dict(checkpoint)
+    raise ValueError(
+        "Format checkpoint tidak sesuai dengan model V2."
+    )
 
 model = model.to(DEVICE)
 model.eval()
 
 print(f"Model  : {MODEL_PATH}")
+print(f"Classes: {CLASSES}")
 print(f"Device : {DEVICE}")
 
 if torch.cuda.is_available():
@@ -132,101 +135,79 @@ def root():
 # PREDICT
 # ============================================================
 
+
 @app.post("/predict")
-async def predict(
-    file: UploadFile = File(...)
-):
+async def predict(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Nama file tidak tersedia."
+        )
+
+    if file.content_type and not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=415,
+            detail="File harus berupa gambar."
+        )
 
     try:
-
-        # ----------------------------------------------------
-        # Read image
-        # ----------------------------------------------------
-
         contents = await file.read()
 
-        image = Image.open(
-            io.BytesIO(contents)
-        ).convert("RGB")
+        if not contents:
+            raise HTTPException(
+                status_code=400,
+                detail="File gambar kosong."
+            )
 
-        # ----------------------------------------------------
-        # Transform
-        # ----------------------------------------------------
+        try:
+            image = Image.open(io.BytesIO(contents)).convert("RGB")
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="File tidak dapat dibaca sebagai gambar."
+            )
 
-        input_tensor = transform(image)
-        input_tensor = input_tensor.unsqueeze(0)
-        input_tensor = input_tensor.to(DEVICE)
-
-        # ----------------------------------------------------
-        # Prediction
-        # ----------------------------------------------------
+        input_tensor = transform(image).unsqueeze(0).to(DEVICE)
 
         with torch.no_grad():
-
             outputs = model(input_tensor)
+            probabilities = torch.softmax(outputs, dim=1)
 
-            probabilities = torch.softmax(
-                outputs,
-                dim=1
-            )
-
-            confidence, predicted = torch.max(
+            top_probs, top_indices = torch.topk(
                 probabilities,
+                k=len(CLASSES),
                 dim=1
             )
 
-        predicted_class = CLASSES[
-            predicted.item()
-        ]
-
-        confidence_percent = (
-            confidence.item() * 100
-        )
-
-        # ----------------------------------------------------
-        # Top predictions
-        # ----------------------------------------------------
-
-        top_probs, top_indices = torch.topk(
-            probabilities,
-            k=len(CLASSES),
-            dim=1
-        )
+        predicted_index = top_indices[0, 0].item()
+        predicted_class = CLASSES[predicted_index]
+        confidence_percent = top_probs[0, 0].item() * 100
 
         top_predictions = []
 
-        for prob, index in zip(
-            top_probs[0],
-            top_indices[0]
-        ):
-
+        for prob, index in zip(top_probs[0], top_indices[0]):
             top_predictions.append({
                 "class": CLASSES[index.item()],
-                "confidence": round(
-                    prob.item() * 100,
-                    2
-                )
+                "confidence": round(prob.item() * 100, 2)
             })
 
-        # ----------------------------------------------------
-        # Response
-        # ----------------------------------------------------
+        print(f"Filename   : {file.filename}")
+        print(f"Prediction : {predicted_class}")
+        print(f"Confidence : {confidence_percent:.2f}%")
 
         return {
             "success": True,
             "version": "2.0.0",
             "filename": file.filename,
             "prediction": predicted_class,
-            "confidence": round(
-                confidence_percent,
-                2
-            ),
+            "confidence": round(confidence_percent, 2),
             "top_predictions": top_predictions
         }
 
-    except Exception as e:
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Terjadi kesalahan saat memproses gambar."
+        )

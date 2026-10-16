@@ -1,14 +1,15 @@
+
 import json
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
 from torchvision import datasets, models, transforms
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 
 # ============================================================
@@ -27,6 +28,10 @@ BATCH_SIZE = 32
 NUM_EPOCHS = 15
 LEARNING_RATE = 0.0001
 
+BEST_MODEL_PATH = MODEL_DIR / "revalue_efficientnet_b0_v2_candidate_best.pth"
+FINAL_MODEL_PATH = MODEL_DIR / "revalue_efficientnet_b0_v2_candidate_final.pth"
+HISTORY_PATH = MODEL_DIR / "training_history_v2_candidate.json"
+
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
@@ -39,7 +44,7 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 # ============================================================
 
 print("=" * 60)
-print("ReValue AI V2 - Waste Material Classification")
+print("ReValue AI V2 - Candidate Model Training")
 print("=" * 60)
 
 print(f"Device : {DEVICE}")
@@ -52,36 +57,39 @@ print("=" * 60)
 
 
 # ============================================================
+# CHECK DATASET
+# ============================================================
+
+for directory in [TRAIN_DIR, VAL_DIR, TEST_DIR]:
+    if not directory.exists():
+        raise FileNotFoundError(
+            f"Folder dataset tidak ditemukan: {directory}"
+        )
+
+
+# ============================================================
 # TRANSFORMS
 # ============================================================
 
 train_transform = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-
     transforms.RandomHorizontalFlip(),
-
     transforms.RandomRotation(10),
-
     transforms.ColorJitter(
         brightness=0.2,
         contrast=0.2,
         saturation=0.2
     ),
-
     transforms.ToTensor(),
-
     transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225]
     ),
 ])
 
-
 val_test_transform = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-
     transforms.ToTensor(),
-
     transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225]
@@ -107,6 +115,17 @@ test_dataset = datasets.ImageFolder(
     TEST_DIR,
     transform=val_test_transform
 )
+
+if not train_dataset.classes:
+    raise ValueError("Dataset train tidak memiliki kelas.")
+
+if (
+    train_dataset.classes != val_dataset.classes
+    or train_dataset.classes != test_dataset.classes
+):
+    raise ValueError(
+        "Daftar kelas train, validation, dan test tidak sama."
+    )
 
 train_loader = DataLoader(
     train_dataset,
@@ -136,14 +155,12 @@ test_loader = DataLoader(
 
 classes = train_dataset.classes
 
-print()
-print("Classes:")
+print("\nClasses:")
 
 for i, class_name in enumerate(classes):
     print(f"  {i}: {class_name}")
 
-print()
-print(f"Jumlah kelas : {len(classes)}")
+print(f"\nJumlah kelas : {len(classes)}")
 print(f"Train        : {len(train_dataset)}")
 print(f"Validation   : {len(val_dataset)}")
 print(f"Test         : {len(test_dataset)}")
@@ -153,18 +170,14 @@ print(f"Test         : {len(test_dataset)}")
 # TRAIN DISTRIBUTION
 # ============================================================
 
-print()
-print("Distribusi train:")
+print("\nDistribusi train:")
 
-for class_name in classes:
+class_counts = np.bincount(
+    train_dataset.targets,
+    minlength=len(classes)
+)
 
-    class_index = train_dataset.class_to_idx[class_name]
-
-    count = sum(
-        1 for _, label in train_dataset.samples
-        if label == class_index
-    )
-
+for class_name, count in zip(classes, class_counts):
     print(f"  {class_name:<18}: {count}")
 
 
@@ -172,8 +185,7 @@ for class_name in classes:
 # MODEL
 # ============================================================
 
-print()
-print("Loading EfficientNet-B0 pretrained...")
+print("\nLoading EfficientNet-B0 pretrained...")
 
 model = models.efficientnet_b0(
     weights=models.EfficientNet_B0_Weights.DEFAULT
@@ -192,10 +204,37 @@ print("Model siap.")
 
 
 # ============================================================
-# LOSS & OPTIMIZER
+# CLASS-WEIGHTED LOSS
 # ============================================================
 
-criterion = nn.CrossEntropyLoss()
+class_weights = (
+    class_counts.sum() / class_counts
+) ** 0.5
+
+class_weights = class_weights / class_weights.mean()
+
+class_weights = torch.tensor(
+    class_weights,
+    dtype=torch.float32,
+    device=DEVICE
+)
+
+print("\nBobot kelas:")
+
+for class_name, count, weight in zip(
+    classes,
+    class_counts,
+    class_weights.tolist()
+):
+    print(
+        f"  {class_name:<18} "
+        f"| Sampel: {count:4d} "
+        f"| Bobot: {weight:.3f}"
+    )
+
+criterion = nn.CrossEntropyLoss(
+    weight=class_weights
+)
 
 optimizer = optim.AdamW(
     model.parameters(),
@@ -207,8 +246,7 @@ optimizer = optim.AdamW(
 # TRAINING
 # ============================================================
 
-best_val_acc = 0.0
-
+best_val_acc = -1.0
 history = []
 
 start_time = time.time()
@@ -235,25 +273,14 @@ for epoch in range(NUM_EPOCHS):
         optimizer.zero_grad()
 
         outputs = model(images)
-
-        loss = criterion(
-            outputs,
-            labels
-        )
+        loss = criterion(outputs, labels)
 
         loss.backward()
-
         optimizer.step()
 
-        train_loss += (
-            loss.item() *
-            labels.size(0)
-        )
+        train_loss += loss.item() * labels.size(0)
 
-        predictions = torch.argmax(
-            outputs,
-            dim=1
-        )
+        predictions = torch.argmax(outputs, dim=1)
 
         train_correct += (
             predictions == labels
@@ -261,13 +288,8 @@ for epoch in range(NUM_EPOCHS):
 
         train_total += labels.size(0)
 
-    train_loss /= train_total
-
-    train_acc = (
-        train_correct /
-        train_total
-    )
-
+    train_loss /= max(train_total, 1)
+    train_acc = train_correct / max(train_total, 1)
 
     # --------------------------------------------------------
     # VALIDATION
@@ -287,21 +309,11 @@ for epoch in range(NUM_EPOCHS):
             labels = labels.to(DEVICE)
 
             outputs = model(images)
+            loss = criterion(outputs, labels)
 
-            loss = criterion(
-                outputs,
-                labels
-            )
+            val_loss += loss.item() * labels.size(0)
 
-            val_loss += (
-                loss.item() *
-                labels.size(0)
-            )
-
-            predictions = torch.argmax(
-                outputs,
-                dim=1
-            )
+            predictions = torch.argmax(outputs, dim=1)
 
             val_correct += (
                 predictions == labels
@@ -309,12 +321,8 @@ for epoch in range(NUM_EPOCHS):
 
             val_total += labels.size(0)
 
-    val_loss /= val_total
-
-    val_acc = (
-        val_correct /
-        val_total
-    )
+    val_loss /= max(val_total, 1)
+    val_acc = val_correct / max(val_total, 1)
 
     elapsed = time.time() - epoch_start
 
@@ -327,9 +335,8 @@ for epoch in range(NUM_EPOCHS):
         f"| Time: {elapsed:.1f}s"
     )
 
-
     # --------------------------------------------------------
-    # SAVE BEST MODEL
+    # SAVE BEST CANDIDATE MODEL
     # --------------------------------------------------------
 
     if val_acc > best_val_acc:
@@ -343,15 +350,13 @@ for epoch in range(NUM_EPOCHS):
                 "image_size": IMAGE_SIZE,
                 "val_accuracy": best_val_acc,
             },
-            MODEL_DIR /
-            "revalue_efficientnet_b0_v2_best.pth"
+            BEST_MODEL_PATH
         )
 
         print(
-            f"  -> Best model disimpan "
+            "  -> Candidate best disimpan "
             f"(Val Acc: {best_val_acc:.4f})"
         )
-
 
     history.append({
         "epoch": epoch + 1,
@@ -364,21 +369,22 @@ for epoch in range(NUM_EPOCHS):
 
 
 # ============================================================
-# TEST
+# TEST BEST CANDIDATE MODEL
 # ============================================================
 
-print()
-print("=" * 60)
-print("FINAL TEST")
+print("\n" + "=" * 60)
+print("FINAL TEST - CANDIDATE MODEL")
 print("=" * 60)
 
-# Load best model
+if not BEST_MODEL_PATH.exists():
+    raise FileNotFoundError(
+        f"Checkpoint kandidat tidak ditemukan: {BEST_MODEL_PATH}"
+    )
 
 best_checkpoint = torch.load(
-    MODEL_DIR /
-    "revalue_efficientnet_b0_v2_best.pth",
+    BEST_MODEL_PATH,
     map_location=DEVICE,
-    weights_only=False
+    weights_only=True
 )
 
 model.load_state_dict(
@@ -399,21 +405,11 @@ with torch.no_grad():
         labels = labels.to(DEVICE)
 
         outputs = model(images)
+        loss = criterion(outputs, labels)
 
-        loss = criterion(
-            outputs,
-            labels
-        )
+        test_loss += loss.item() * labels.size(0)
 
-        test_loss += (
-            loss.item() *
-            labels.size(0)
-        )
-
-        predictions = torch.argmax(
-            outputs,
-            dim=1
-        )
+        predictions = torch.argmax(outputs, dim=1)
 
         test_correct += (
             predictions == labels
@@ -421,19 +417,15 @@ with torch.no_grad():
 
         test_total += labels.size(0)
 
-test_loss /= test_total
-
-test_acc = (
-    test_correct /
-    test_total
-)
+test_loss /= max(test_total, 1)
+test_acc = test_correct / max(test_total, 1)
 
 print(f"Test Loss : {test_loss:.4f}")
 print(f"Test Acc  : {test_acc:.4f}")
 
 
 # ============================================================
-# SAVE FINAL MODEL
+# SAVE FINAL CANDIDATE MODEL
 # ============================================================
 
 torch.save(
@@ -441,10 +433,10 @@ torch.save(
         "model_state_dict": model.state_dict(),
         "classes": classes,
         "image_size": IMAGE_SIZE,
+        "val_accuracy": best_val_acc,
         "test_accuracy": test_acc,
     },
-    MODEL_DIR /
-    "revalue_efficientnet_b0_v2_final.pth"
+    FINAL_MODEL_PATH
 )
 
 
@@ -452,10 +444,7 @@ torch.save(
 # SAVE HISTORY
 # ============================================================
 
-with open(
-    MODEL_DIR / "training_history_v2.json",
-    "w"
-) as f:
+with open(HISTORY_PATH, "w", encoding="utf-8") as f:
 
     json.dump(
         history,
@@ -468,49 +457,23 @@ with open(
 # SUMMARY
 # ============================================================
 
-total_time = (
-    time.time() -
-    start_time
-)
+total_time = time.time() - start_time
 
-print()
-print("=" * 60)
-print("TRAINING V2 SELESAI")
+print("\n" + "=" * 60)
+print("CANDIDATE TRAINING SELESAI")
 print("=" * 60)
 
-print(
-    f"Best Validation Accuracy : "
-    f"{best_val_acc:.4f}"
-)
+print(f"Best Validation Accuracy : {best_val_acc:.4f}")
+print(f"Test Accuracy            : {test_acc:.4f}")
+print(f"Total Training Time      : {total_time / 60:.1f} menit")
 
-print(
-    f"Test Accuracy            : "
-    f"{test_acc:.4f}"
-)
+print("\nBest Candidate Model:")
+print(f"  {BEST_MODEL_PATH}")
 
-print(
-    f"Total Training Time      : "
-    f"{total_time / 60:.1f} menit"
-)
+print("\nFinal Candidate Model:")
+print(f"  {FINAL_MODEL_PATH}")
 
-print()
-print("Model:")
-print(
-    "  models\\"
-    "revalue_efficientnet_b0_v2_final.pth"
-)
-
-print()
-print("Best Model:")
-print(
-    "  models\\"
-    "revalue_efficientnet_b0_v2_best.pth"
-)
-
-print()
-print("History:")
-print(
-    "  models\\training_history_v2.json"
-)
+print("\nTraining History:")
+print(f"  {HISTORY_PATH}")
 
 print("=" * 60)
